@@ -1,10 +1,62 @@
-#include "extract_vtable.hpp"
+#include <iostream>
+#include <iomanip>
+#include <vector>
+#include <unordered_map>
+#include <string>
+#include <libelf.h>
+#include <gelf.h>
+#include <fcntl.h>
+#include <cstring>
+#include <unistd.h>
+#include <fstream>
+#include <cstdio>
 
+struct LibraryInfo {
+    std::string path;
+    uint64_t base_address;
+};
+
+struct Symbol_info {
+    std::string lib_name;
+    uint64_t offset;
+    uint64_t size;
+};
 
 std::unordered_map<std::string, LibraryInfo> lib_info;  // lib_name -> path and base_addr
 std::unordered_map<std::string, Symbol_info> symbol_map;  // symbol name -> lib_name 、offset 和 size
 
+struct Symbol {
+    std::string name;
+    uint64_t address;
+    uint64_t type;  // relocation type
+    int64_t addend;
+};
 std::unordered_map<uint64_t, Symbol> reloc_map;  // relocation offset -> symbol name
+
+struct SymbolInfo {
+    std::string name;
+    GElf_Addr address;
+    GElf_Xword size;
+    std::vector<uint8_t> content;
+};
+
+struct VTableEntry {
+    GElf_Addr content;
+    bool is_dynamic;
+    std::string symbol_name;
+    std::string reloc_type;
+    GElf_Addr base_address;
+};
+
+struct VTableInfo {
+    std::string name;
+    GElf_Addr address;
+    GElf_Xword size;
+    std::vector<uint8_t> raw_data;
+    std::vector<VTableEntry> entries;
+};
+
+std::vector<VTableInfo> vtables;
 
 std::string extractFileName(const std::string& path) {
     size_t pos = path.find_last_of("/\\");
@@ -43,15 +95,11 @@ void parse_proc_maps(std::string pid) {
     }
 }
 
-// This function iterates over all known dynamic libraries and parses the symbols of symbols 
-// starting with "_Z" in their dynamic symbol table (SHT_DYNSYM). 
-// For each symbol, its name, address, and size are extracted and stored in a global symbol table (symbol_map).
 void get_symbols_from_libs() {
     elf_version(EV_CURRENT);
 
     for (auto [lib_name, lib] : lib_info) {
         std::string lib_path = lib.path;
-        uint64_t base_address = lib.base_address;
 
         int fd = open(lib_path.c_str(), O_RDONLY);
         if (fd == -1) {
@@ -115,6 +163,7 @@ void get_symbols_from_libs() {
     }
 }
 
+
 bool is_dynsym_section(Elf_Scn *scn, GElf_Shdr &shdr) {
     return (shdr.sh_type == SHT_DYNSYM);
 }
@@ -124,9 +173,7 @@ bool is_rela_dyn_section(Elf *elf, size_t shstrndx, Elf_Scn *scn, GElf_Shdr &shd
             strcmp(elf_strptr(elf, shstrndx, shdr.sh_name), ".rela.dyn") == 0);
 }
 
-// Extract dynamic symbol information (.dynsym) and relocation information (.rela.dyn) from the specified ELF file. 
-// It parses these segments to obtain symbolic information related to dynamic links, especially undefined global symbols.
-int extract_symbols(std::string file_path) {
+int extract_dynamic_symbols(std::string file_path) {
     elf_version(EV_CURRENT);
     int fd = open(file_path.c_str(), O_RDONLY);
     Elf *elf = elf_begin(fd, ELF_C_READ, nullptr);
@@ -185,10 +232,9 @@ int extract_symbols(std::string file_path) {
         GElf_Sym &sym = dynsyms[sym_idx];
         const char *sym_name = elf_strptr(elf, dynsym_shdr.sh_link, sym.st_name);
         if (sym_name == nullptr) continue;
-        if (sym.st_shndx == SHN_UNDEF && 
-            GELF_ST_BIND(sym.st_info) == STB_GLOBAL) {
-            reloc_map[rela.r_offset] = {sym_name, rela.r_offset, GELF_R_TYPE(rela.r_info), rela.r_addend};
-        }
+        if (sym_name[0] != '_' || sym_name[1] != 'Z') continue;
+        reloc_map[rela.r_offset] = {sym_name, rela.r_offset, GELF_R_TYPE(rela.r_info), rela.r_addend};
+        // printf("offset: %lx, name: %s, type: %lx, addend: %lx\n", rela.r_offset, sym_name, GELF_R_TYPE(rela.r_info), rela.r_addend);
     }
 
     elf_end(elf);
@@ -196,121 +242,198 @@ int extract_symbols(std::string file_path) {
     return 0;
 }
 
-uint64_t read_bytes_at_address(const std::string &file_path, uint64_t target_address, size_t num_bytes) {
+void parse_vtable_entries(Elf *elf,VTableInfo &vtable) {
+    int elf_class = gelf_getclass(elf);
+    size_t ptr_size = (elf_class == ELFCLASS32) ? 4 : 8;
+    const uint8_t* data_ptr = vtable.raw_data.data();
+    size_t data_size = vtable.raw_data.size();
+    
+    size_t offset = 0;
+    size_t max_entries = (data_size - ptr_size) / ptr_size;
+
+    for (size_t i = 0; i < max_entries; ++i) {
+        if (offset + ptr_size > data_size) break;
+
+        GElf_Addr entry_content = 0;
+        if (elf_class == ELFCLASS32) {
+            entry_content = *reinterpret_cast<const uint32_t*>(data_ptr + offset);
+        } else {
+            entry_content = *reinterpret_cast<const uint64_t*>(data_ptr + offset);
+        }
+
+        const GElf_Addr entry_addr = vtable.address + offset;
+        VTableEntry entry;
+        entry.content = entry_content;
+        entry.base_address = entry_addr;
+        entry.is_dynamic = false;
+        entry.symbol_name.clear();
+        entry.reloc_type.clear();
+
+        auto reloc_it = reloc_map.find(entry_addr);
+        if (reloc_it != reloc_map.end()) {
+            entry.symbol_name = reloc_it->second.name;
+            entry.reloc_type = reloc_it->second.type;
+            entry.is_dynamic = true;
+            Symbol_info sym = symbol_map[reloc_it->second.name];
+            switch (reloc_it->second.type) {
+                case 1:
+                    entry.content = lib_info[sym.lib_name].base_address + sym.offset + reloc_it->second.addend;
+                    break;
+                case 6:
+                    entry.content = lib_info[sym.lib_name].base_address + sym.offset;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        vtable.entries.push_back(entry);
+        offset += ptr_size;
+    }
+}
+
+int get_vtables(std::string file_path) {
     int fd = open(file_path.c_str(), O_RDONLY);
-    if (fd == -1) {
-        std::cerr << "Cannot open ELF file: " << file_path << std::endl;
-        return 0;
+    if (fd < 0) {
+        std::cerr << "Failed to open file: " << file_path << "\n";
+        return 1;
     }
 
-    elf_version(EV_CURRENT);
     Elf *elf = elf_begin(fd, ELF_C_READ, nullptr);
     if (!elf) {
-        std::cerr << "ELF open failed: " << elf_errmsg(elf_errno()) << std::endl;
+        std::cerr << "ELF parsing failed: " << elf_errmsg(-1) << "\n";
         close(fd);
-        return 0;
+        return 1;
     }
 
-    uint64_t result = 0;
     Elf_Scn *scn = nullptr;
     while ((scn = elf_nextscn(elf, scn)) != nullptr) {
         GElf_Shdr shdr;
-        if (gelf_getshdr(scn, &shdr) != &shdr) {
-            std::cerr << "Error getting section header: " << elf_errmsg(elf_errno()) << std::endl;
-            continue;
-        }
+        if (gelf_getshdr(scn, &shdr) != &shdr) continue;
 
-        if (shdr.sh_type != SHT_PROGBITS && shdr.sh_type != SHT_NOBITS) {
-            continue;
-        }
-        Elf_Data *data = elf_getdata(scn, nullptr);
-        if (!data) {
-            std::cerr << "Error getting section data: " << elf_errmsg(elf_errno()) << std::endl;
-            continue;
-        }
-        uint64_t section_start = shdr.sh_addr;
-        uint64_t section_end = section_start + shdr.sh_size;
+        if (shdr.sh_type == SHT_SYMTAB) {
+            Elf_Data *data = elf_getdata(scn, nullptr);
+            if (!data || !data->d_buf) continue;
 
-        if (target_address >= section_start && target_address < section_end) {
-            size_t offset_in_section = target_address - section_start;
-            if (offset_in_section + num_bytes <= shdr.sh_size) {
-                uint8_t *section_data = (uint8_t *)data->d_buf;
-                uint8_t *data_start = section_data + offset_in_section;
-                for (size_t i = 0; i < num_bytes; ++i) {
-                    result |= (uint64_t)data_start[i] << (8 * i); 
+            size_t count = shdr.sh_size / shdr.sh_entsize;
+            for (size_t i = 0; i < count; ++i) {
+                GElf_Sym sym;
+                if (gelf_getsym(data, i, &sym) != &sym) continue;
+
+                char *name = elf_strptr(elf, shdr.sh_link, sym.st_name);
+                if (!name) continue;
+                if (name[0] != '_' || name[1] != 'Z') continue;
+
+                SymbolInfo info;
+                info.name = name;
+                info.address = sym.st_value;
+                info.size = sym.st_size;
+
+                Elf_Scn *content_scn = elf_getscn(elf, sym.st_shndx);
+                if (!content_scn) continue;
+                
+                GElf_Shdr content_shdr;
+                if (gelf_getshdr(content_scn, &content_shdr) != &content_shdr) continue;
+                
+                Elf_Data *content_data = elf_rawdata(content_scn, nullptr);
+                if (!content_data || !content_data->d_buf) continue;
+
+                const size_t offset = sym.st_value - content_shdr.sh_addr;
+                if (offset + sym.st_size > content_shdr.sh_size) continue;
+
+                info.content.resize(sym.st_size);
+                memcpy(info.content.data(), (char*)content_data->d_buf + offset, sym.st_size);
+                if (info.name.find("_ZTV") == 0) {
+                    if (!info.content.empty()) {
+                        VTableInfo vtable;
+                        vtable.name = info.name;
+                        vtable.address = info.address;
+                        vtable.size = info.size;
+                        vtable.raw_data = info.content;
+                        vtable.entries.clear();
+                        vtables.push_back(vtable);
+                    }
                 }
-            } else {
-                std::cerr << "Requested bytes go beyond section bounds." << std::endl;
             }
-            break;
         }
+    }
+    int elf_class = gelf_getclass(elf);
+    size_t ptr_size = (elf_class == ELFCLASS32) ? 4 : 8;
+    // 为每个 vtable 生成 raw_data
+    for (auto& vtable : vtables) {
+        parse_vtable_entries(elf, vtable);   
+        vtable.raw_data.clear(); // 清空原有数据
+        for (const auto& entry : vtable.entries) {
+            GElf_Addr content = entry.content;
+            
+            // 将 content 按小端序转换为字节流
+            uint8_t bytes[8] = {0}; // 64位足够存储
+            for (size_t i = 0; i < ptr_size; ++i) {
+                bytes[i] = (content >> (i * 8)) & 0xFF;
+            }
+            
+            // 追加到 raw_data
+            vtable.raw_data.insert(
+                vtable.raw_data.end(), 
+                bytes, 
+                bytes + ptr_size
+            );
+        }
+        printf("vtable name: %s, raw_data size: %lu\n", vtable.name.c_str(), vtable.raw_data.size());
+        for (size_t i = 0; i < vtable.raw_data.size(); ++i) {
+            printf("%02x ", vtable.raw_data[i]);
+        }
+        printf("\n");
     }
 
     elf_end(elf);
     close(fd);
-    return result;
+    return 0;
 }
 
-void solve_relocations(std::string file_path, std::string output_path) {
-    std::vector<VTable> vtable_list;
-    for (auto [address, sym] : reloc_map) {
-        std::string sym_name = sym.name;
-        if (sym_name.compare(0, 4, "_ZTV") != 0 && sym_name.compare(0, 4, "_ZTC") != 0) continue;
-        if (auto it = symbol_map.find(sym_name); it != symbol_map.end()) {
-            const auto &symbol_info = it->second;
-            uint64_t reloced_addr =  lib_info[symbol_info.lib_name].base_address + symbol_info.offset + sym.addend;
-            uint64_t size = symbol_info.size;
-            
-            for (size_t i = 0; i < size / 8; ++i) {
-                std::vector<uint8_t> content;
-                content.reserve(size); 
-                const uint64_t ptr_offset = address + i * 8;
-                uint64_t addr = 0;
+void save_vtables_to_binary(const std::vector<VTableInfo>& vtables,
+                           const char* filename) {
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) {
+        perror("Failed to open output file");
+        return;
+    }
 
-                if (auto it = reloc_map.find(ptr_offset); it != reloc_map.end()) {
-                    const Symbol symbol = it->second;
-                    std::string sym_name = symbol.name;
-                    if (auto sym_it = symbol_map.find(sym_name); sym_it != symbol_map.end()) {
-                        const auto &symbol_info_sub = sym_it->second;
-                        switch (symbol.type) {
-                            case 257:
-                            case 1025:
-                                addr = lib_info[symbol_info_sub.lib_name].base_address + symbol_info_sub.offset + symbol.addend;
-                                break;
-                            default:
-                                break;
-                        }
-                    }
-                }
-                for (int j = 0; j < 8; ++j) {
-                    content.push_back(static_cast<uint8_t>((addr >> (j * 8)) & 0xFF));
-                }
-                vtable_list.push_back({ptr_offset, std::move(content)});
-            }
+    for (const auto& vtable : vtables) {
+        // 强制使用固定宽度类型
+        const uint64_t address = static_cast<uint64_t>(vtable.address);
+        const uint64_t data_size = vtable.raw_data.size();  // 使用实际数据长度
 
+        // 写入地址字段 (8字节)
+        if (fwrite(&address, sizeof(address), 1, fp) != 1) {
+            perror("Address write failed");
+            fclose(fp);
+            return;
+        }
+
+        // 写入数据长度字段 (8字节)
+        if (fwrite(&data_size, sizeof(data_size), 1, fp) != 1) {
+            perror("Size write failed");
+            fclose(fp);
+            return;
+        }
+
+        // 写入机器码数据
+        if (data_size > 0) {
+            const size_t written = fwrite(vtable.raw_data.data(), 1, data_size, fp);
         }
     }
 
-    std::ofstream out(output_path, std::ios::binary);
-    if (!out) {
-        printf("Failed to create output file: %s \n", output_path.c_str());
-        return;
+    if (fclose(fp) != 0) {
+        perror("File closure failed");
     }
-    for (const auto& vt : vtable_list) {
-        if (vt.address == 0) continue;
-        VTableHeader header{
-            .address = static_cast<long>(vt.address), 
-            .len = static_cast<long>(vt.content.size())
-        };
-        out.write(reinterpret_cast<const char*>(&header), sizeof(header));
-        out.write(reinterpret_cast<const char*>(vt.content.data()), vt.content.size());
-    }
-
 }
 
-void process_vtables(std::string file_path, std::string pid, std::string output_path) {
-    parse_proc_maps(pid);
+
+void process_vtables(const std::string &bolted_binary_path, const std::string &target_pid, const std::string &v_table_bin_path) {
+    parse_proc_maps(target_pid);
     get_symbols_from_libs();
-    extract_symbols(file_path);
-    solve_relocations(file_path, output_path);
+    extract_dynamic_symbols(bolted_binary_path);
+    get_vtables(bolted_binary_path);
+    save_vtables_to_binary(vtables, v_table_bin_path.c_str());
 }
